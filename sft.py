@@ -14,13 +14,17 @@ import functools
 import torch
 import argparse
 import transformers
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+from transformers.models.gemma2.modeling_gemma2 import Gemma2DecoderLayer
+from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
 from transformers import LlamaForCausalLM
 from torch.distributed.fsdp import FullyShardedDataParallel  as FSDP
 from torch.distributed import fsdp
 from torch.distributed.fsdp.fully_sharded_data_parallel import (
     CPUOffload,
     BackwardPrefetch,
-    FullyShardedDataParallel
+    FullyShardedDataParallel,
+    MixedPrecision,
 )
 from torch.distributed.fsdp.wrap import (
     size_based_auto_wrap_policy,
@@ -30,14 +34,18 @@ from torch.distributed.fsdp.wrap import (
 from torch.distributed.fsdp.wrap import (
     transformer_auto_wrap_policy)
 
-# add lib path ../../train/scripts
+
 import sys
-sys.path.append('../train/scripts')
-import dataset
-from dataset import SupervisedDataset
+import mydataset
+from mydataset import SupervisedDataset
 import os
+mydataset.MASK_MODE = 1
 
+from liger_kernel.transformers import apply_liger_kernel_to_llama, apply_liger_kernel_to_gemma, apply_liger_kernel_to_qwen2
 
+apply_liger_kernel_to_gemma()
+apply_liger_kernel_to_llama()
+apply_liger_kernel_to_qwen2()
 
 
 
@@ -54,23 +62,29 @@ training_group = parser.add_argument_group("Training Options")
 training_group.add_argument('--per_device_train_batch_size', type=int, default=2, help="Batch size per device during training, default is 2.")
 training_group.add_argument('--per_device_eval_batch_size', type=int, default=2, help="Batch size per device during evaluation, default is 2.")
 training_group.add_argument('--gradient_accumulation_steps', type=int, default=4, help="Number of gradient accumulation steps, default is 4.")
-training_group.add_argument('--warmup_steps', type=int, default=15, help="Number of warmup steps, default is 5.")
+training_group.add_argument('--warmup_steps', type=int, default=15, help="Number of warmup steps.")
 training_group.add_argument('--max_steps', type=int, default=99999, help="Maximum number of training steps.")
-training_group.add_argument('--learning_rate', type=float, default=1e-5, help="Learning rate, default is 2e-4.")
+training_group.add_argument('--learning_rate', type=float, default=1e-5, help="Learning rate.")
 #training_group.add_argument('--optim', type=str, default="adamw", help="Optimizer type.")
 training_group.add_argument('--weight_decay', type=float, default=0.0, help="Weight decay.")
-training_group.add_argument('--lr_scheduler_type', type=str, default="constant_with_warmup", help="Learning rate scheduler type, default is 'linear'.")
-training_group.add_argument('--seed', type=int, default=3407, help="Seed for reproducibility, default is 3407.")
+training_group.add_argument('--lr_scheduler_type', type=str, default="constant_with_warmup", help="Learning rate scheduler type.")
+training_group.add_argument('--seed', type=int, default=3407, help="Seed for reproducibility.")
 training_group.add_argument('--train_dataset', type=str, default="", help="Path to the training dataset.")
 training_group.add_argument('--eval_dataset', type=str, default="", help="Path to the evaluation dataset.")
 training_group.add_argument('--sample_format', type=str, default="fourfourml", help="Sample format for the dataset, default is 'fourfourml'.")
-training_group.add_argument('--max_grad_norm', type=float, default=10.0, help="Maximum gradient norm, default is 1.0.")
+training_group.add_argument('--max_grad_norm', type=float, default=1.0, help="Maximum gradient norm, default is 1.0.")
 training_group.add_argument('--num_train_epochs', type=int, default=1, help="Number of training epochs, default is 1.")
 training_group.add_argument('--eval_steps', type=int, default=1, help="Evaluation steps, default is 1.")
 training_group.add_argument('--no_mask', action='store_true', help="Do not mask the labels in dataset")
 training_group.add_argument('--attn_impl', type=str, default="flash_attention_2", help="Attention implementation to use, default is 'flash_attention_2'.")
-training_group.add_argument('--model_arch', type=str, default="llama", help="Model architecture to use, default is 'llama'.")
-training_group.add_argument('--report_to', type=str, default="wandb", help="Report to service, default is 'wandb'.")
+training_group.add_argument('--report_to', type=str, default="wandb", help="Report to service(wandb/none), default is 'wandb'.")
+training_group.add_argument('--fp16', action='store_true', help="Use fp16 instead of bf16")
+training_group.add_argument('--lora_r', type=int, default=128, help="Lora R")
+training_group.add_argument('--lora_alpha', type=int, default=32, help="Lora Alpha")
+training_group.add_argument('--lora_dropout', type=float, default=0.05, help="Lora Dropout")
+training_group.add_argument('--lora', action='store_true', help="Use Lora")
+training_group.add_argument('--save_steps', type=int, default=99999, help="Save steps")
+training_group.add_argument('--askpass', action='store_true', help="Ask for password")
 
 # Saving and pushing arguments
 save_group = parser.add_argument_group('Save Model Options')
@@ -81,58 +95,131 @@ save_group.add_argument('--save_path', type=str, default="final", help="Path to 
 args = parser.parse_args()
 
 
+DTYPE = torch.bfloat16
+if args.fp16:
+    DTYPE = torch.float16
+
 if args.no_mask:
-    dataset.NO_MASK = True
+    mydataset.NO_MASK = True
 
-from liger_kernel.transformers import apply_liger_kernel_to_llama, apply_liger_kernel_to_gemma
+if args.askpass:
+    objList = [None]
+    if dist.get_rank() == 0:
+        import getpass
+        password = getpass.getpass('[?] Enter password: ')
+        objList[0] = password
+    dist.broadcast_object_list(objList, src=0)
+    #print(objList)
+    mydataset.PASS = objList[0]
 
-
-print('Loading model into CPU')
+print('[+] Loading model into CPU')
 model = transformers.AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path, trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=DTYPE,
         attn_implementation=args.attn_impl,
     )
+
+if args.lora:
+    print('[+] Preparing LoRA...')
+    from peft import (
+        prepare_model_for_kbit_training,
+        LoraConfig,
+        get_peft_model,
+        PeftModel
+    )
+    config = LoraConfig(
+                r=args.lora_r,
+                lora_alpha=args.lora_alpha,
+                target_modules=["q_proj", "v_proj", "up_proj", "down_proj", 'gate_proj', 'o_proj'],
+                lora_dropout=args.lora_dropout,
+                bias="none",
+                task_type="CAUSAL_LM",
+                init_lora_weights="olora"
+            )
+    model = get_peft_model(model, config, autocast_adapter_dtype=False)
+
+
+from functools import partial
+
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    checkpoint_wrapper,
+    CheckpointImpl,
+    apply_activation_checkpointing,
+)
+
+non_reentrant_wrapper = partial(
+    checkpoint_wrapper,
+    checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+)
+
+check_fn = lambda submodule: isinstance(submodule, LlamaDecoderLayer)
+
+def apply_fsdp_checkpointing(model):
+    """apply activation checkpointing to model
+    returns None as model is updated directly
+    """
+    print(f"[*] applying fsdp activation checkpointing...")
+
+    apply_activation_checkpointing(
+        model, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn=check_fn
+    )
+
+model.enable_input_require_grads()
 model.gradient_checkpointing_enable()
+apply_fsdp_checkpointing(model)
 
-apply_liger_kernel_to_gemma()
-apply_liger_kernel_to_llama()
 
-print('model loaded at: ', model.model.embed_tokens.weight.device)
+
+#print('model loaded at: ', model.model.embed_tokens.weight.device)
 
 tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.tokenizer_path,
-        model_max_length=args.max_length,
-        padding_side="right",
         use_fast=True,
-        trust_remote_code=True,
-    )
+        trust_remote_code=True)
+        
 
-print("Tokenizer loaded...")
-
+print("[+] Tokenizer loaded.")
 
 fullPath = os.path.join(args.output_dir, args.save_path)
-if not os.path.exists(fullPath):
-    os.makedirs(fullPath)
+if dist.get_rank() == 0:
+    os.makedirs(fullPath, exist_ok=True)
 
-print('Model loaded, configuring FSDP')
+print('[+] Model loaded, configuring FSDP...')
 
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer
-from transformers.models.gemma2.modeling_gemma2 import Gemma2DecoderLayer
+
 
 auto_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
         transformer_layer_cls={
             LlamaDecoderLayer,
-            Gemma2DecoderLayer
+            Gemma2DecoderLayer,
+            Qwen2DecoderLayer
         },
     )
+
+mixed_percision = MixedPrecision(
+    param_dtype=torch.bfloat16,
+    # Gradient communication precision.
+    reduce_dtype=torch.bfloat16,
+    # Buffer precision.
+    buffer_dtype=torch.bfloat16,
+)
+
+if DTYPE == torch.float16:
+    mixed_percision = MixedPrecision(
+        param_dtype=torch.float16,
+        # Gradient communication precision.
+        reduce_dtype=torch.float16,
+        # Buffer precision.
+        buffer_dtype=torch.float16,
+    )
+
 fsdp_config = {
     "auto_wrap_policy": auto_wrap_policy,
     "cpu_offload": CPUOffload(offload_params=True),
     "backward_prefetch": BackwardPrefetch.BACKWARD_POST,
     "ignored_modules": [],
-    "mixed_precision": None,  # Set this if you want to use mixed precision
+    "mixed_precision": mixed_percision,  # Set this if you want to use mixed precision
     "sync_module_states": False,
     "use_orig_params": True,
     #"device_id": torch.cuda.current_device(),
@@ -173,24 +260,24 @@ def print_model_details(model):
 
 
 
-print("Loading dataset...")
+print("[*] Loading dataset...")
 eval_datasets = {}
 for filepath in args.eval_dataset.split(","):
     filename = os.path.splitext(os.path.basename(filepath))[0]
     # Use smaller sequence length for faster evaluation and pick 50 samples randomly
     eval_datasets[filename] = SupervisedDataset(
-        filepath, tokenizer, sample_format=args.sample_format
+        filepath, tokenizer,  max_length=args.max_length, sample_format=args.sample_format
     )
-    print("Loaded eval dataset", filename, len(eval_datasets[filename]))
+    print("[+] Loaded eval dataset", filename, len(eval_datasets[filename]))
 
 train_dataset = SupervisedDataset(
-    args.train_dataset, tokenizer, sample_format=args.sample_format
+    args.train_dataset, tokenizer, max_length=args.max_length, sample_format=args.sample_format
 )
-#print("Loaded train dataset", len(train_dataset))
+print("[+] Loaded train dataset", len(train_dataset))
 item = train_dataset[0]
 #print('input_ids', item['input_ids'].tolist())
 #print('labels', item['labels'].tolist())
-print('input_ids', tokenizer.decode(item['input_ids'].tolist()))
+#print('input_ids', tokenizer.decode(item['input_ids'].tolist()))
 
 
 
@@ -206,11 +293,11 @@ train_loader = torch.utils.data.DataLoader(
     train_dataset,
     batch_size=args.per_device_train_batch_size,
     sampler=train_sampler,
-    num_workers=4,
+    num_workers=0,
     pin_memory=True
 )
 
-print("eval_datasets: ", eval_datasets)
+#print("eval_datasets: ", eval_datasets)
 eval_loaders = {
     name: torch.utils.data.DataLoader(
         dataset,
@@ -220,12 +307,12 @@ eval_loaders = {
             num_replicas=dist.get_world_size(),
             rank=dist.get_rank()
         ),
-        num_workers=4,
+        num_workers=0,
         pin_memory=True
     )
     for name, dataset in eval_datasets.items()
 }
-print("eval_loaders: ", eval_loaders)
+# print("eval_loaders: ", eval_loaders)
 
 
 import torch
@@ -239,11 +326,14 @@ import math
 
 def myLogInit():
     if dist.get_rank() == 0:
-        wandb.init(project=os.environ['WANDB_PROJECT'], config=args)
+        if args.report_to == 'wandb':
+            wandb.init(project=os.environ['WANDB_PROJECT'], config=args)
 
 def myLogDeinit():
     if dist.get_rank() == 0:
-        wandb.finish()
+        if args.report_to == 'wandb':
+            print('[*] Finishing wandb..')
+            wandb.finish()
 
 
 def myLog(dict):
@@ -255,6 +345,16 @@ def myLog(dict):
 
 myLogInit()
 
+def doSave(save_path = 'final'):
+    print('[*] Preparing state_dict for saving...')
+    cfg = fsdp.FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    with FSDP.state_dict_type(model, fsdp.StateDictType.FULL_STATE_DICT, cfg):
+        state_dict = model.state_dict()
+        if dist.get_rank() == 0:
+            print("[+] Got state_dict, saving model...")    
+            fullPath = os.path.join(args.output_dir, save_path)
+            model.save_pretrained(fullPath, state_dict = state_dict)
+            print(f"[+] Model saved to {fullPath}")
 
 
 # Training loop
@@ -335,11 +435,12 @@ for epoch in range(args.num_train_epochs):
             accumulated_loss = 0
 
             if current_step >= args.max_steps:
-                print('current_step >= args.max_steps, breaking')
+                print('[*] current_step >= args.max_steps, breaking')
                 print(current_step, args.max_steps)
                 break
 
             if current_step % args.eval_steps == 0:
+                mydataset.setMaskMode(0)
                 model.eval()
                 torch.cuda.empty_cache()
                 for eval_name, eval_loader in eval_loaders.items():
@@ -361,24 +462,21 @@ for epoch in range(args.num_train_epochs):
                     global_eval_loss = eval_loss_tensor[0].item() / max(eval_loss_tensor[1].item(), 0.001)
                     reportObj[f"eval_{eval_name}_loss"] =  global_eval_loss
 
-                if dist.get_rank() == 0:
-                    myLog(reportObj)
                 model.train()
+
+            if dist.get_rank() == 0:
+                myLog(reportObj)
+
+            if (current_step % args.save_steps) == 0:
+                doSave(f"step_{current_step}")
 
 progress_bar.close()
 
-print('Training finished...')
+print('[+] Training finished...')
 
 dist.barrier()
 
-cfg = fsdp.FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-with FSDP.state_dict_type(model, fsdp.StateDictType.FULL_STATE_DICT, cfg):
-    state_dict = model.state_dict()
-    if dist.get_rank() == 0:
-        print("Saving model...")      
-        fullPath = os.path.join(args.output_dir, args.save_path)
-        model.save_pretrained(fullPath, state_dict = state_dict)
-        print(f"Model saved to {fullPath}")
+doSave(args.save_path)
 
 dist.barrier()
 

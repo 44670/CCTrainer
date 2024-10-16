@@ -1,0 +1,4 @@
+liger_kernel
+transformers
+peft
+wandb
