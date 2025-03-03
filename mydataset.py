@@ -15,7 +15,17 @@ IGNORE_INDEX = -100
 
 NO_MASK = False
 
-SEPS = ['\n', '\n\n', '、', '，' , '。', '；']
+MASK_MODE = 0
+
+PATTERN_ONLY_END_IDX = -999
+PATTERN_CHECKBOARD_00001_IDX = 1
+PATTERN_CHECKBOARD_10000_IDX = 2
+PATTERN_ONLY_SEPS_IDX = 3
+PATTERN_COT = 4
+
+SEPS = ['\n', '\n\n', '、', '，' , '。', '；', '<|action|>', '<|think|>']
+
+COT_SEPS =  ['<|action|>', '<|think|>']
 
 
 import hashlib
@@ -40,7 +50,9 @@ def decrypt_file(filename, password):
 
     plaintext = cipher.decrypt(ciphertext)
 
-    lines = plaintext.decode('utf-8').splitlines()
+    lines = plaintext.decode('utf-8').split('\n')
+    if lines[-1].strip() == '':
+        lines = lines[:-1]
 
     return lines
 
@@ -59,7 +71,7 @@ class SupervisedDataset(Dataset):
             global ChaCha20
             from Crypto.Cipher import ChaCha20
             lines = decrypt_file(file_path, PASS)
-            for line in lines:
+            for line in tqdm(lines):
                 item = json.loads(line)
                 self.data.append(item)
         else:
@@ -84,6 +96,7 @@ class SupervisedDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, index):
+        global MASK_MODE
         # print('__getitem__', index)
         if index in self.cached_items:
             return self.cached_items[index]
@@ -111,6 +124,35 @@ class SupervisedDataset(Dataset):
                     labels += [IGNORE_INDEX] * len(self.role_assistant_says_ids)
                     inp = self.tokenizer.encode(f'{content}<|end|>\n', add_special_tokens=False)
                     input_ids += inp
+                    if MASK_MODE > 0:
+                        if len(inp) > 20:
+                            if MASK_MODE == PATTERN_ONLY_END_IDX:
+                                inp[5:-2] = [IGNORE_INDEX] * (len(inp) - 7)
+                            elif MASK_MODE == PATTERN_CHECKBOARD_00001_IDX:
+                                for j in range(6, len(inp) - 6, 5):
+                                    inp[j] = IGNORE_INDEX
+                                    inp[j+1] = IGNORE_INDEX
+                                    inp[j+2] = IGNORE_INDEX
+                                    inp[j+3] = IGNORE_INDEX
+                            elif MASK_MODE == PATTERN_CHECKBOARD_10000_IDX:
+                                for j in range(6, len(inp) - 6, 5):
+                                    inp[j+1] = IGNORE_INDEX
+                                    inp[j+2] = IGNORE_INDEX
+                                    inp[j+3] = IGNORE_INDEX
+                                    inp[j+4] = IGNORE_INDEX
+                            elif MASK_MODE == PATTERN_ONLY_SEPS_IDX:
+                                cnt = 0
+                                for j in range(6, len(inp) - 6):
+                                    if inp[j] in self.sep_ids_set:
+                                        # Ignore the seps 
+                                        inp[j] = IGNORE_INDEX
+                                        cnt = 4
+                                    else:
+                                        if cnt > 0:
+                                            cnt -= 1
+                                        else:
+                                            inp[j] = IGNORE_INDEX # Ignore the content
+
                     inp[-1] = IGNORE_INDEX 
                     labels += inp
         
@@ -141,3 +183,7 @@ class SupervisedDataset(Dataset):
         self.cached_items[index] = ret
         return ret
 
+
+def setMaskMode(m):
+    global MASK_MODE
+    MASK_MODE = m

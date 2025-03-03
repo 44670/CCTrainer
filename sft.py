@@ -1,4 +1,6 @@
 
+import sys
+print("Python interpreter:", sys.executable)
 import torch.distributed as dist
 import os
 import torch
@@ -7,6 +9,7 @@ dist.init_process_group("nccl")
 local_rank = int(os.environ["LOCAL_RANK"])
 print("Local rank", local_rank)
 torch.cuda.set_device(local_rank)
+from muon import Muon
 
 import functools
 
@@ -17,6 +20,7 @@ import transformers
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.models.gemma2.modeling_gemma2 import Gemma2DecoderLayer
 from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
+from transformers.models.mistral.modeling_mistral import MistralDecoderLayer
 from transformers import LlamaForCausalLM
 from torch.distributed.fsdp import FullyShardedDataParallel  as FSDP
 from torch.distributed import fsdp
@@ -39,13 +43,13 @@ import sys
 import mydataset
 from mydataset import SupervisedDataset
 import os
-mydataset.MASK_MODE = 1
 
-from liger_kernel.transformers import apply_liger_kernel_to_llama, apply_liger_kernel_to_gemma, apply_liger_kernel_to_qwen2
-
+from liger_kernel.transformers import apply_liger_kernel_to_mistral,apply_liger_kernel_to_llama, apply_liger_kernel_to_gemma, apply_liger_kernel_to_qwen2
+apply_liger_kernel_to_mistral()
 apply_liger_kernel_to_gemma()
 apply_liger_kernel_to_llama()
 apply_liger_kernel_to_qwen2()
+
 
 
 
@@ -80,11 +84,12 @@ training_group.add_argument('--attn_impl', type=str, default="flash_attention_2"
 training_group.add_argument('--report_to', type=str, default="wandb", help="Report to service(wandb/none), default is 'wandb'.")
 training_group.add_argument('--fp16', action='store_true', help="Use fp16 instead of bf16")
 training_group.add_argument('--lora_r', type=int, default=128, help="Lora R")
-training_group.add_argument('--lora_alpha', type=int, default=32, help="Lora Alpha")
+training_group.add_argument('--lora_alpha', type=int, default=64, help="Lora Alpha")
 training_group.add_argument('--lora_dropout', type=float, default=0.05, help="Lora Dropout")
 training_group.add_argument('--lora', action='store_true', help="Use Lora")
 training_group.add_argument('--save_steps', type=int, default=99999, help="Save steps")
 training_group.add_argument('--askpass', action='store_true', help="Ask for password")
+training_group.add_argument('--zero_steps', type=int, default=30, help="Zero steps")
 
 # Saving and pushing arguments
 save_group = parser.add_argument_group('Save Model Options')
@@ -119,6 +124,8 @@ model = transformers.AutoModelForCausalLM.from_pretrained(
         attn_implementation=args.attn_impl,
     )
 
+model.config.use_cache = False
+
 if args.lora:
     print('[+] Preparing LoRA...')
     from peft import (
@@ -152,7 +159,18 @@ non_reentrant_wrapper = partial(
     checkpoint_impl=CheckpointImpl.NO_REENTRANT,
 )
 
-check_fn = lambda submodule: isinstance(submodule, LlamaDecoderLayer)
+decoderLayerSet = {
+            LlamaDecoderLayer,
+            Gemma2DecoderLayer,
+            Qwen2DecoderLayer,
+            MistralDecoderLayer
+}
+
+def check_fn(module):
+    for layer in decoderLayerSet:
+        if isinstance(module, layer):
+            return True
+    return False
 
 def apply_fsdp_checkpointing(model):
     """apply activation checkpointing to model
@@ -190,11 +208,7 @@ print('[+] Model loaded, configuring FSDP...')
 
 auto_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
-        transformer_layer_cls={
-            LlamaDecoderLayer,
-            Gemma2DecoderLayer,
-            Qwen2DecoderLayer
-        },
+        transformer_layer_cls=decoderLayerSet,
     )
 
 mixed_percision = MixedPrecision(
@@ -368,19 +382,36 @@ total_steps = math.ceil(total_batches / args.gradient_accumulation_steps)
 
 
 # Optimizer and learning rate scheduler
-optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+optimizer = torch.optim.AdamW(model.parameters(), lr=0, weight_decay=args.weight_decay, betas=(0.9,0.95))
+"""
 lr_scheduler = transformers.get_scheduler(
     name=args.lr_scheduler_type,
     optimizer=optimizer,
     num_warmup_steps=args.warmup_steps,
     num_training_steps=total_steps,
-)
+)"""
+
 
 
 progress_bar = tqdm(total=total_steps, disable=dist.get_rank() != 0)
 
-
 current_step = 0
+currentLR = 0
+
+def calcCurrentLR(step):
+    global currentLR
+    if step < args.zero_steps:
+        return 0
+    step -= args.zero_steps
+    if step < args.warmup_steps:
+        return args.learning_rate * (step / args.warmup_steps)
+    return args.learning_rate
+
+def upeateLR(lr):
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
+upeateLR(calcCurrentLR(0))
 
 # [loss, batch_size]
 train_loss_tensor = torch.zeros(2, device=local_rank)
@@ -412,10 +443,12 @@ for epoch in range(args.num_train_epochs):
             
             torch.cuda.empty_cache()
             optimizer.step()
-            lr_scheduler.step()
+            
             optimizer.zero_grad()
 
             current_step += 1
+            currentLR = calcCurrentLR(current_step)
+            upeateLR(currentLR)
 
             train_loss_tensor[0] = accumulated_loss * input_ids.size(0)
             train_loss_tensor[1] = input_ids.size(0)
@@ -423,7 +456,7 @@ for epoch in range(args.num_train_epochs):
             global_train_loss = train_loss_tensor[0].item() / max(train_loss_tensor[1].item(), 0.001)
             reportObj = {
                     "loss": global_train_loss,
-                    "learning_rate": lr_scheduler.get_last_lr()[0],
+                    "learning_rate": currentLR,
                     "step": current_step,
                     "total_grad_norm": total_grad_norm
                 }
